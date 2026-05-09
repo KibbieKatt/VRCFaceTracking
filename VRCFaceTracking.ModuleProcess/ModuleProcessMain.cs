@@ -1,4 +1,5 @@
-﻿using System.CommandLine;
+using System.CommandLine;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.DependencyInjection;
@@ -14,6 +15,8 @@ public class ModuleProcessMain
 {
     // How long in seconds we should wait for a connection to be established before giving up
     private const double CONNECTION_TIMEOUT = 60.0; // This is long because some modules like the Vive Facial Tracker software can take a long time to initialise
+    private static readonly TimeSpan ConnectionTimeout = TimeSpan.FromSeconds(CONNECTION_TIMEOUT);
+    private static readonly TimeSpan PushUpdateWatchdog = TimeSpan.FromMilliseconds(25);
     private static bool WaitForPackets = true;
     public static ModuleAssembly DefModuleAssembly;
     public static ILoggerFactory? LoggerFactory;
@@ -21,16 +24,69 @@ public class ModuleProcessMain
     public static VrcftSandboxClient Client;
     public static CancellationTokenSource cts = new();
 
-    private static Queue<IpcPacket> _packetsToSend = new ();
+    private static readonly ConcurrentQueue<IpcPacket> _packetsToSend = new();
+    private static readonly AutoResetEvent _packetsQueued = new(false);
+    private static int _replyUpdateQueued;
+    private static long _lastUpdateActivityTimestamp = Stopwatch.GetTimestamp();
+    private static long _lastInboundPacketTimestamp = Stopwatch.GetTimestamp();
+    private static int _pushWatchdogFireCount;
+    private static int _replyUpdateEnqueueCount;
+    private static long _replyUpdateEnqueueLogTimestamp = Stopwatch.GetTimestamp();
+    private static int _moduleInitialized;
 
-    private static object _callbackLock = new ();
-    private static bool _shouldCallReceive = false;
-    public static void QueueReceiveEvent()
+    private static void MarkUpdateActivity()
     {
-        lock ( _callbackLock )
+        Interlocked.Exchange(ref _lastUpdateActivityTimestamp, Stopwatch.GetTimestamp());
+    }
+
+    private static void MarkInboundPacket()
+    {
+        Interlocked.Exchange(ref _lastInboundPacketTimestamp, Stopwatch.GetTimestamp());
+    }
+
+    private static void EnqueuePacket(IpcPacket packet)
+    {
+        if (packet.GetPacketType() == IpcPacket.PacketType.ReplyUpdate)
         {
-            _shouldCallReceive = true;
+            if (Interlocked.Exchange(ref _replyUpdateQueued, 1) == 1)
+                return;
+
+            MarkUpdateActivity();
+            var enqueueCount = Interlocked.Increment(ref _replyUpdateEnqueueCount);
+            var now = Stopwatch.GetTimestamp();
+            if (enqueueCount == 1 || Stopwatch.GetElapsedTime(Interlocked.Read(ref _replyUpdateEnqueueLogTimestamp)) >= TimeSpan.FromSeconds(5))
+            {
+                Interlocked.Exchange(ref _replyUpdateEnqueueLogTimestamp, now);
+                Logger?.LogInformation("ReplyUpdate enqueue stats: count={count} connected={connected}", enqueueCount, Client?.IsConnected);
+            }
         }
+
+        _packetsToSend.Enqueue(packet);
+        _packetsQueued.Set();
+    }
+
+    private static void QueueImmediateUpdate()
+    {
+        EnqueuePacket(new ReplyUpdatePacket());
+    }
+
+    private static bool ShouldKickPushWatchdog()
+    {
+        if (DefModuleAssembly?.TrackingModule?.SupportsPushUpdates != true)
+            return false;
+
+        if (DefModuleAssembly._updateCts?.IsCancellationRequested == true)
+            return false;
+
+        return Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastUpdateActivityTimestamp)) >= PushUpdateWatchdog;
+    }
+
+    private static bool IsWaitingForInitialHostTraffic()
+    {
+        if (Client == null || !Client.IsConnected)
+            return true;
+
+        return Volatile.Read(ref _moduleInitialized) == 0;
     }
 
     public static int Main(string[] args)
@@ -39,7 +95,7 @@ public class ModuleProcessMain
         {
             Logger.LogInformation("Received SIGTERM");
             WaitForPackets = false;
-            DefModuleAssembly._updateCts.Cancel();
+            DefModuleAssembly._updateCts?.Cancel();
             cts.Cancel();
             cts.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(5));
         };
@@ -94,9 +150,6 @@ public class ModuleProcessMain
 
     static int VrcftMain(string modulePath, int serverPortNumber)
     {
-        // Give the main process enough time to add the module to the list before we begin sending data
-        Thread.Sleep(50);
-
         ServiceProvider serviceProvider = new ServiceCollection()
         .AddLogging((loggingBuilder) => loggingBuilder
                 .ClearProviders()
@@ -111,9 +164,11 @@ public class ModuleProcessMain
 
         LoggerFactory = serviceProvider.GetService<ILoggerFactory>();
         Logger = LoggerFactory.CreateLogger<ModuleProcessMain>();
+        TryElevateRealtimePriority();
+        Interlocked.Exchange(ref _lastInboundPacketTimestamp, Stopwatch.GetTimestamp());
+        Volatile.Write(ref _moduleInitialized, 0);
 
         // A module process will connect to a given port number first. We try connecting to the server for 30 seconds, then give up, returning an error code in the process.
-        Stopwatch stopwatch = new Stopwatch(); // For timeout
         Client = new VrcftSandboxClient(serverPortNumber, LoggerFactory);
 
         // Bind the log function so that we can forward log messages to VRCFT's main process
@@ -126,6 +181,8 @@ public class ModuleProcessMain
         // Try loading the module
         DefModuleAssembly = new ModuleAssembly(Logger, LoggerFactory, modulePath);
         DefModuleAssembly.TryLoadAssembly();
+        if (DefModuleAssembly.TrackingModule != null)
+            DefModuleAssembly.TrackingModule.RequestImmediateUpdate = QueueImmediateUpdate;
 
         // Initialise to invalid state
         UnifiedTracking.Data = new() {
@@ -152,10 +209,8 @@ public class ModuleProcessMain
             UnifiedTracking.Data.Shapes[i].Weight = 0xFFFFFFFF;
         }
 
-        Client.OnReceiveShouldBeQueued += QueueReceiveEvent;
         Client.OnPacketReceivedCallback += (in IpcPacket packet) => {
-            // Reset the timeout
-            stopwatch.Restart();
+            MarkInboundPacket();
 
             // Handle packets
             switch ( packet.GetPacketType() )
@@ -168,7 +223,7 @@ public class ModuleProcessMain
                             eyeAvailable        = result.SupportsEye,
                             expressionAvailable = result.SupportsExpression
                         };
-                        _packetsToSend.Enqueue(pkt);
+                        EnqueuePacket(pkt);
                         break;
                     }
                 case IpcPacket.PacketType.EventInit:
@@ -191,14 +246,19 @@ public class ModuleProcessMain
                         }
                         
                         DefModuleAssembly._updateCts = new CancellationTokenSource();
-                        var thread = new Thread(() =>
+                        Volatile.Write(ref _moduleInitialized, 1);
+                        MarkUpdateActivity();
+                        if (!DefModuleAssembly.TrackingModule.SupportsPushUpdates)
                         {
-                            while (!DefModuleAssembly._updateCts.IsCancellationRequested)
+                            var thread = new Thread(() =>
                             {
-                                DefModuleAssembly.TrackingModule.Update();
-                            }
-                        });
-                        thread.Start();
+                                while (!DefModuleAssembly._updateCts.IsCancellationRequested)
+                                {
+                                    DefModuleAssembly.TrackingModule.Update();
+                                }
+                            });
+                            thread.Start();
+                        }
                         
                         var pktNew = new ReplyInitPacket()
                         {
@@ -207,7 +267,8 @@ public class ModuleProcessMain
                             ModuleInformationName   = DefModuleAssembly.TrackingModule.ModuleInformation.Name,
                             IconDataStreams         = DefModuleAssembly.TrackingModule.ModuleInformation.StaticImages
                         };
-                        _packetsToSend.Enqueue(pktNew);
+                        pktNew.prefersPushUpdates = DefModuleAssembly.TrackingModule.SupportsPushUpdates;
+                        EnqueuePacket(pktNew);
                         break;
                     }
 
@@ -243,7 +304,7 @@ public class ModuleProcessMain
                     {
                         // Logger.LogDebug("EventUpdate");
                         var pkt = new ReplyUpdatePacket();
-                        _packetsToSend.Enqueue(pkt);
+                        EnqueuePacket(pkt);
                         break;
                     }
 
@@ -265,35 +326,53 @@ public class ModuleProcessMain
         // Start the connection
         Client.Connect(modulePath);
         Logger.LogInformation("Initializing {module}", DefModuleAssembly.Assembly.ToString());
-
-        stopwatch.Start();
         
         // Loop infinitely while we wait for commands
         while ( WaitForPackets && !cts.IsCancellationRequested)
         {
-            if ( stopwatch.Elapsed.TotalSeconds > CONNECTION_TIMEOUT )
+            if (IsWaitingForInitialHostTraffic() &&
+                Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastInboundPacketTimestamp)) > ConnectionTimeout)
             {
+                Logger.LogWarning(
+                    "Sandbox module {module} timed out waiting for initial host traffic. connected={connected} initialized={initialized} modulePath={modulePath}",
+                    DefModuleAssembly?.TrackingModule?.ModuleInformation.Name ?? DefModuleAssembly?.Assembly?.GetName().Name ?? "Unknown",
+                    Client?.IsConnected,
+                    Volatile.Read(ref _moduleInitialized) == 1,
+                    modulePath);
                 Client.Close();
                 return ModuleProcessExitCodes.NETWORK_CONNECTION_TIMED_OUT;
             }
 
             // Send packets in loop
+            var sentPacket = false;
             while (_packetsToSend.TryDequeue(out IpcPacket pkt))
             {
                 if (pkt == null) continue;  // Ignore your IDE. This can and will be null at some point as we're not locking
+                if (pkt.GetPacketType() == IpcPacket.PacketType.ReplyUpdate)
+                    Interlocked.Exchange(ref _replyUpdateQueued, 0);
                 Client.SendData(pkt);
+                sentPacket = true;
             }
 
-            // Tell the client to receive data
-            if ( _shouldCallReceive )
+            if (!sentPacket)
             {
-                Client.ReceivePackets();
-            }
+                var waitTimeout = Client.IsConnected ? 10 : 50;
+                WaitHandle.WaitAny([_packetsQueued, cts.Token.WaitHandle], waitTimeout);
 
-            Thread.Sleep(1);
+                if (ShouldKickPushWatchdog())
+                {
+                    if (Interlocked.Increment(ref _pushWatchdogFireCount) == 1 || _pushWatchdogFireCount % 50 == 0)
+                        Logger.LogWarning(
+                            "Push update watchdog fired for {module}. Queueing fallback update. connected={connected}",
+                            DefModuleAssembly?.TrackingModule?.ModuleInformation.Name ?? "Unknown",
+                            Client?.IsConnected);
+
+                    QueueImmediateUpdate();
+                }
+            }
         }
         
-        DefModuleAssembly._updateCts.Cancel();
+        DefModuleAssembly._updateCts?.Cancel();
 
         if (OperatingSystem.IsWindows())
         {
@@ -302,5 +381,30 @@ public class ModuleProcessMain
 
         Environment.Exit(ModuleProcessExitCodes.OK);
         return ModuleProcessExitCodes.OK;
+    }
+
+    private static void TryElevateRealtimePriority()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            using var currentProcess = Process.GetCurrentProcess();
+            currentProcess.PriorityClass = ProcessPriorityClass.AboveNormal;
+        }
+        catch
+        {
+            // Best-effort only.
+        }
+
+        try
+        {
+            Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+        }
+        catch
+        {
+            // Best-effort only.
+        }
     }
 }

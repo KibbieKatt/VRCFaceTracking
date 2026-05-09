@@ -11,6 +11,7 @@ namespace VRCFaceTracking.Core.Services;
 
 public class OscRecvService : BackgroundService
 {
+    private static readonly TimeSpan RebindIdleDelay = TimeSpan.FromMilliseconds(10);
     private readonly ILogger<OscRecvService> _logger;
     private readonly IOscTarget _oscTarget;
     private readonly ILocalSettingsService _settingsService;
@@ -108,30 +109,40 @@ public class OscRecvService : BackgroundService
 
         while (!_stoppingToken.IsCancellationRequested)
         {
-            if (_linkedToken.IsCancellationRequested || _recvSocket is not { IsBound: true })
+            var linkedToken = _linkedToken.Token;
+            var recvSocket = _recvSocket;
+
+            if (linkedToken.IsCancellationRequested || recvSocket is not { IsBound: true })
             {
+                try
+                {
+                    await Task.Delay(RebindIdleDelay, _stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Ignore global shutdown wakeups.
+                }
+
                 continue;
             }
 
             try
             {
-                if (_recvSocket.Available > 0)
+                var bytesReceived =
+                    await recvSocket.ReceiveAsync(_recvBuffer, SocketFlags.None, linkedToken);
+                if (bytesReceived <= 0)
                 {
-                    var bytesReceived =
-                        await _recvSocket.ReceiveAsync(_recvBuffer, SocketFlags.None, _linkedToken.Token);
-                    var offset = 0;
-                    var newMsg = OscMessage.TryParseOsc(_recvBuffer, bytesReceived, ref offset);
-                    if (newMsg == null)
-                    {
-                        continue;
-                    }
+                    continue;
+                }
 
-                    OnMessageReceived(newMsg);
-                }
-                else
+                var offset = 0;
+                var newMsg = OscMessage.TryParseOsc(_recvBuffer, bytesReceived, ref offset);
+                if (newMsg == null)
                 {
-                    await Task.Delay(100, _linkedToken.Token);
+                    continue;
                 }
+
+                OnMessageReceived(newMsg);
             }
             catch (Exception e)
             {

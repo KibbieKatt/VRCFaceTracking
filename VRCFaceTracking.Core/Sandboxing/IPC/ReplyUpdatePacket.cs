@@ -1,9 +1,5 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading.Tasks;
+using System.Buffers.Binary;
 using VRCFaceTracking.Core.Params.Data;
 using VRCFaceTracking.Core.Params.Expressions;
 
@@ -13,7 +9,14 @@ public class ReplyUpdatePacket : IpcPacket
     const int EXPRESSION_COUNT = (int)UnifiedExpressions.Max + 1;
     const float INVALID_FLOAT = 0xFFFFFFFF;
 
-    [StructLayout(LayoutKind.Sequential)]
+    private const int ScalarFloatCount = 16;
+    private const int PayloadFloatCount = ScalarFloatCount + EXPRESSION_COUNT;
+
+    private UpdateDataContiguous _contiguousUnifiedData = new ()
+    {
+        Expression_Shapes = new float[EXPRESSION_COUNT]
+    };
+
     internal class UpdateDataContiguous
     {
         internal float Eye_MaxDilation;
@@ -37,14 +40,8 @@ public class ReplyUpdatePacket : IpcPacket
         internal float Head_PosY;
         internal float Head_PosZ;
 
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = EXPRESSION_COUNT)]
         internal float[] Expression_Shapes;
     }
-
-    private UpdateDataContiguous _contiguousUnifiedData = new ()
-    {
-        Expression_Shapes = new float[EXPRESSION_COUNT]
-    };
 
     public override PacketType GetPacketType() => PacketType.ReplyUpdate;
 
@@ -54,9 +51,8 @@ public class ReplyUpdatePacket : IpcPacket
     {
         // Build handshake packet
 
-        byte[] packetTypeBytes = BitConverter.GetBytes((uint)GetPacketType());
-
-        int packetSize = SIZE_PACKET_MAGIC + SIZE_PACKET_TYPE;
+        var payloadSize = PayloadFloatCount * sizeof(float);
+        var packetSize = SIZE_PACKET_MAGIC + SIZE_PACKET_TYPE + sizeof(int) + payloadSize;
 
         // Update the internal data structure to match the current state of unified tracking
         _contiguousUnifiedData.Eye_Left_GazeX               = UnifiedTracking.Data.Eye.Left.Gaze.x;
@@ -86,49 +82,58 @@ public class ReplyUpdatePacket : IpcPacket
             _contiguousUnifiedData.Expression_Shapes[i] = UnifiedTracking.Data.Shapes[i].Weight;
         }
 
-        // Convert _contiguousUnifiedData to bytes
-        int sizeStruct = Marshal.SizeOf<UpdateDataContiguous>();
-        byte[] sizeStructBytes = BitConverter.GetBytes(sizeStruct);
-        byte[] arr = new byte[sizeStruct];
-
-        var ptr = IntPtr.Zero;
-        try
-        {
-            ptr = Marshal.AllocHGlobal(sizeStruct);
-            Marshal.StructureToPtr(_contiguousUnifiedData, ptr, false);
-            Marshal.Copy(ptr, arr, 0, sizeStruct);
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(ptr);
-        }
-
-        packetSize = packetSize + sizeof(int) + sizeStruct;
-
-        // Prepare buffer
         byte[] finalDataStream = new byte[packetSize];
-        Buffer.BlockCopy(HANDSHAKE_MAGIC,   0, finalDataStream, 0,  SIZE_PACKET_MAGIC);     // Magic
-        Buffer.BlockCopy(packetTypeBytes,   0, finalDataStream, 4,  SIZE_PACKET_TYPE);      // Packet Type
-        Buffer.BlockCopy(sizeStructBytes,   0, finalDataStream, 8,  sizeof(int));           // Struct.Length
-        Buffer.BlockCopy(arr,               0, finalDataStream, 12, sizeStruct);            // Data
+        Buffer.BlockCopy(HANDSHAKE_MAGIC, 0, finalDataStream, 0, SIZE_PACKET_MAGIC);
+        BinaryPrimitives.WriteUInt32LittleEndian(finalDataStream.AsSpan(4, sizeof(uint)), (uint)GetPacketType());
+        BinaryPrimitives.WriteInt32LittleEndian(finalDataStream.AsSpan(8, sizeof(int)), payloadSize);
+
+        var offset = 12;
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_MaxDilation);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_MinDilation);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_Left_GazeX);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_Left_GazeY);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_Left_PupilDiameter_MM);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_Left_Openness);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_Right_GazeX);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_Right_GazeY);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_Right_PupilDiameter_MM);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Eye_Right_Openness);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Head_Yaw);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Head_Pitch);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Head_Roll);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Head_PosX);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Head_PosY);
+        WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Head_PosZ);
+        for (int i = 0; i < _contiguousUnifiedData.Expression_Shapes.Length; i++)
+        {
+            WriteFloat(finalDataStream, ref offset, _contiguousUnifiedData.Expression_Shapes[i]);
+        }
 
         return finalDataStream;
     }
 
     public override void Decode(in byte[] data)
     {
-        int structSize = BitConverter.ToInt32(data, 8);
-        
-        var ptr = IntPtr.Zero;
-        try
+        var offset = 12;
+        _contiguousUnifiedData.Eye_MaxDilation = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_MinDilation = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_Left_GazeX = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_Left_GazeY = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_Left_PupilDiameter_MM = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_Left_Openness = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_Right_GazeX = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_Right_GazeY = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_Right_PupilDiameter_MM = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Eye_Right_Openness = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Head_Yaw = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Head_Pitch = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Head_Roll = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Head_PosX = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Head_PosY = ReadFloat(data, ref offset);
+        _contiguousUnifiedData.Head_PosZ = ReadFloat(data, ref offset);
+        for (int i = 0; i < _contiguousUnifiedData.Expression_Shapes.Length; i++)
         {
-            ptr = Marshal.AllocHGlobal(structSize);
-            Marshal.Copy(data, 12, ptr, structSize);
-            Marshal.PtrToStructure<UpdateDataContiguous>(ptr, _contiguousUnifiedData);
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(ptr);
+            _contiguousUnifiedData.Expression_Shapes[i] = ReadFloat(data, ref offset);
         }
     }
 
@@ -201,5 +206,18 @@ public class ReplyUpdatePacket : IpcPacket
             if ( _contiguousUnifiedData.Expression_Shapes[i] != INVALID_FLOAT)
                 UnifiedTracking.Data.Shapes[i].Weight = _contiguousUnifiedData.Expression_Shapes[i];
         }
+    }
+
+    private static void WriteFloat(byte[] buffer, ref int offset, float value)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(offset, sizeof(float)), BitConverter.SingleToUInt32Bits(value));
+        offset += sizeof(float);
+    }
+
+    private static float ReadFloat(byte[] buffer, ref int offset)
+    {
+        var value = BitConverter.UInt32BitsToSingle(BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(offset, sizeof(float))));
+        offset += sizeof(float);
+        return value;
     }
 }

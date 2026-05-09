@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
+using VRCFaceTracking.Core.Services;
 using VRCFaceTracking.Core.Contracts.Services;
 using VRCFaceTracking.Core.Sandboxing;
 using VRCFaceTracking.Core.Sandboxing.IPC;
@@ -11,6 +12,10 @@ namespace VRCFaceTracking.Core.Library;
 
 public class UnifiedLibManager : ILibManager
 {
+    private const int SandboxedUpdateCadenceMs = 1;
+    private static readonly TimeSpan PushModuleKickThreshold = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan PushModuleRestartThreshold = TimeSpan.FromMilliseconds(1000);
+    private static readonly TimeSpan PushModuleWatchdogPeriod = TimeSpan.FromMilliseconds(100);
     #region Logger
     private readonly ILogger<UnifiedLibManager> _logger;
     private readonly ILogger _moduleLogger;
@@ -33,6 +38,10 @@ public class UnifiedLibManager : ILibManager
     private List<Assembly> AvailableModules { get; set; }
     private readonly List<ModuleRuntimeInfo> _moduleThreads = new();
     private readonly IModuleDataService _moduleDataService;
+    private CancellationTokenSource? _sandboxWatchdogCts;
+    private Thread? _sandboxWatchdogThread;
+    private readonly Dictionary<int, int> _replyUpdateCounts = new();
+    private readonly Dictionary<int, long> _replyUpdateLogTimestamps = new();
 
     private string _sandboxProcessPath { get; set; }
     private List<ModuleRuntimeInfo> AvailableSandboxModules = new ();
@@ -52,7 +61,10 @@ public class UnifiedLibManager : ILibManager
         _moduleDataService = moduleDataService;
 
         LoadedModulesMetadata = new ObservableCollection<ModuleMetadataInternal>();
-        _sandboxProcessPath = Path.GetFullPath(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "VRCFaceTracking.ModuleProcess.exe" : "VRCFaceTracking.ModuleProcess");
+        var sandboxProcessFileName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? "VRCFaceTracking.ModuleProcess.exe"
+            : "VRCFaceTracking.ModuleProcess";
+        _sandboxProcessPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, sandboxProcessFileName));
         if ( !File.Exists(_sandboxProcessPath) )
         {
             // @TODO: Better error handling
@@ -62,8 +74,285 @@ public class UnifiedLibManager : ILibManager
         // @TODO: Kill any lingering sub-modules to eliminate any conflicts
     }
 
+    private void StartSandboxWatchdog()
+    {
+        if (_sandboxWatchdogThread?.IsAlive ?? false)
+            return;
+
+        _sandboxWatchdogCts = new CancellationTokenSource();
+        _sandboxWatchdogThread = new Thread(() =>
+        {
+            while (!_sandboxWatchdogCts.IsCancellationRequested)
+            {
+                try
+                {
+                    MonitorSandboxModules();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Sandbox watchdog iteration failed.");
+                }
+
+                _sandboxWatchdogCts.Token.WaitHandle.WaitOne(PushModuleWatchdogPeriod);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "VRCFT Sandbox Watchdog"
+        };
+        _sandboxWatchdogThread.Start();
+    }
+
+    private void MonitorSandboxModules()
+    {
+        if (_sandboxServer == null)
+            return;
+
+        List<ModuleRuntimeInfo> snapshot;
+        lock (AvailableSandboxModules)
+        {
+            snapshot = AvailableSandboxModules.ToList();
+        }
+
+        foreach (var module in snapshot)
+        {
+            if (!IsSandboxProcessAlive(module))
+            {
+                HandleExitedSandboxModule(module, snapshot.Count);
+                continue;
+            }
+
+            if (!module.IsActive ||
+                !module.PrefersPushUpdates ||
+                module.SandboxProcessPort <= 0 ||
+                !(module.ModuleInformation?.Active ?? false))
+            {
+                continue;
+            }
+
+            var staleFor = Stopwatch.GetElapsedTime(Interlocked.Read(ref module.LastReplyUpdateTimestamp));
+            if (staleFor < PushModuleKickThreshold)
+            {
+                if (Volatile.Read(ref module.StaleKickCount) != 0)
+                    Interlocked.Exchange(ref module.StaleKickCount, 0);
+                continue;
+            }
+
+            if (staleFor >= PushModuleRestartThreshold)
+            {
+                if (Interlocked.CompareExchange(ref module.RestartInProgress, 1, 0) != 0)
+                    continue;
+
+                var restartAttempt = Interlocked.Increment(ref module.RestartCount);
+                var moduleName = module.ModuleInformation?.Name ?? module.ModuleClassName ?? "Unknown";
+                _logger.LogWarning(
+                    "Sandbox module {module} pid={pid} port={port} stopped producing ReplyUpdate packets for {elapsedMs} ms. Restarting module (attempt {attempt}). activeEntries={entryCount}",
+                    moduleName,
+                    module.SandboxProcessPID,
+                    module.SandboxProcessPort,
+                    staleFor.TotalMilliseconds,
+                    restartAttempt,
+                    snapshot.Count);
+
+                ThreadPool.QueueUserWorkItem(_ => RestartSandboxModule(module));
+                continue;
+            }
+
+            var kickCount = Interlocked.Increment(ref module.StaleKickCount);
+            if (kickCount == 1 || kickCount % 20 == 0)
+            {
+                var moduleName = module.ModuleInformation?.Name ?? module.ModuleClassName ?? "Unknown";
+                _logger.LogWarning(
+                    "Sandbox module {module} pid={pid} port={port} has not produced ReplyUpdate packets for {elapsedMs} ms. Sending fallback EventUpdate kick. activeEntries={entryCount}",
+                    moduleName,
+                    module.SandboxProcessPID,
+                    module.SandboxProcessPort,
+                    staleFor.TotalMilliseconds,
+                    snapshot.Count);
+            }
+
+            _sandboxServer.SendData(new EventUpdatePacket(), module.SandboxProcessPort);
+        }
+    }
+
+    private void HandleExitedSandboxModule(ModuleRuntimeInfo module, int activeEntryCount)
+    {
+        var moduleName = module.ModuleInformation?.Name ?? module.ModuleClassName ?? "Unknown";
+        var exitCodeText = TryGetSandboxExitCode(module, out var exitCode)
+            ? exitCode.ToString()
+            : "unknown";
+        var isShuttingDown = _sandboxWatchdogCts?.IsCancellationRequested == true;
+        var canRestart = !isShuttingDown &&
+                         module.SandboxProcessPort > 0 &&
+                         !string.IsNullOrWhiteSpace(module.SandboxModulePath);
+
+        if (!canRestart)
+        {
+            CleanupExitedSandboxModule(module);
+            _logger.LogWarning(
+                "Pruning exited sandbox module entry for {module}. pid={pid} port={port} exitCode={exitCode} shuttingDown={shuttingDown} isActive={isActive} moduleActive={moduleActive} status={status}",
+                moduleName,
+                module.SandboxProcessPID,
+                module.SandboxProcessPort,
+                exitCodeText,
+                isShuttingDown,
+                module.IsActive,
+                module.ModuleInformation?.Active,
+                module.Status);
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref module.RestartInProgress, 1, 0) != 0)
+            return;
+
+        var restartAttempt = Interlocked.Increment(ref module.RestartCount);
+        _logger.LogWarning(
+            "Sandbox module {module} pid={pid} port={port} exited unexpectedly (exitCode={exitCode}). Restarting module (attempt {attempt}). activeEntries={entryCount} isActive={isActive} moduleActive={moduleActive} status={status}",
+            moduleName,
+            module.SandboxProcessPID,
+            module.SandboxProcessPort,
+            exitCodeText,
+            restartAttempt,
+            activeEntryCount,
+            module.IsActive,
+            module.ModuleInformation?.Active,
+            module.Status);
+
+        ThreadPool.QueueUserWorkItem(_ => RestartSandboxModule(module));
+    }
+
+    private void CleanupExitedSandboxModule(ModuleRuntimeInfo module)
+    {
+        ReleaseModuleTrackingClaims(module);
+        lock (AvailableSandboxModules)
+        {
+            AvailableSandboxModules.Remove(module);
+        }
+
+        RemoveLoadedModuleMetadata(module.ModuleInformation?.Name ?? module.ModuleClassName ?? "Unknown");
+    }
+
+    private static bool TryGetSandboxExitCode(ModuleRuntimeInfo module, out int exitCode)
+    {
+        exitCode = default;
+        try
+        {
+            if (module?.Process == null)
+                return false;
+
+            module.Process.Refresh();
+            if (!module.Process.HasExited)
+                return false;
+
+            exitCode = module.Process.ExitCode;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void RemoveLoadedModuleMetadata(string moduleName)
+    {
+        if (string.IsNullOrWhiteSpace(moduleName))
+            return;
+
+        _dispatcherService.Run(() =>
+        {
+            for (var i = LoadedModulesMetadata.Count - 1; i >= 0; i--)
+            {
+                if (!string.Equals(LoadedModulesMetadata[i].Name, moduleName, StringComparison.Ordinal))
+                    continue;
+
+                LoadedModulesMetadata.RemoveAt(i);
+            }
+        });
+    }
+
+    private static bool IsSandboxProcessAlive(ModuleRuntimeInfo module)
+    {
+        try
+        {
+            if (module?.Process == null)
+                return false;
+
+            module.Process.Refresh();
+            return !module.Process.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void RestartSandboxModule(ModuleRuntimeInfo module)
+    {
+        try
+        {
+            var modulePath = module.SandboxModulePath;
+            var moduleName = module.ModuleInformation?.Name ?? module.ModuleClassName ?? "Unknown";
+
+            var teardownSuccess = false;
+            try
+            {
+                teardownSuccess = TeardownModuleSandboxed(module, gracefulRequest: false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed tearing down stale sandbox module {module}.", moduleName);
+            }
+
+            KillSandboxProcess(module);
+
+            lock (AvailableSandboxModules)
+            {
+                AvailableSandboxModules.Remove(module);
+            }
+
+            RemoveLoadedModuleMetadata(moduleName);
+
+            if (!teardownSuccess)
+                _logger.LogWarning("Sandbox module {module} did not tear down cleanly before restart.", moduleName);
+
+            InitialiseSandboxesBaseOnPaths([modulePath]);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref module.LastReplyUpdateTimestamp, Stopwatch.GetTimestamp());
+            Interlocked.Exchange(ref module.StaleKickCount, 0);
+            Interlocked.Exchange(ref module.RestartInProgress, 0);
+        }
+    }
+
+    private void KillSandboxProcess(ModuleRuntimeInfo module)
+    {
+        try
+        {
+            Process? proc = module.Process;
+            if (proc == null && module.SandboxProcessPID > 0)
+                proc = Process.GetProcessById(module.SandboxProcessPID);
+
+            if (proc == null)
+                return;
+
+            proc.Refresh();
+            if (proc.HasExited)
+                return;
+
+            _logger.LogWarning("Killing lingering sandbox process {pid}.", proc.Id);
+            proc.Kill(entireProcessTree: true);
+            proc.WaitForExit(2000);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed killing lingering sandbox process {pid}.", module.SandboxProcessPID);
+        }
+    }
+
     public void Initialize()
     {
+        StartSandboxWatchdog();
         LoadedModulesMetadata.Clear();
         LoadedModulesMetadata.Add(new ModuleMetadataInternal
         { 
@@ -179,6 +468,10 @@ public class UnifiedLibManager : ILibManager
                             // Update support variables
                             AvailableSandboxModules[moduleIndex].SupportsEyeTracking        = AvailableSandboxModules[moduleIndex].SupportsEyeTracking && replyInitPacket.eyeSuccess;
                             AvailableSandboxModules[moduleIndex].SupportsExpressionTracking = AvailableSandboxModules[moduleIndex].SupportsExpressionTracking && replyInitPacket.expressionSuccess;
+                            AvailableSandboxModules[moduleIndex].PrefersPushUpdates         = replyInitPacket.prefersPushUpdates;
+                            Interlocked.Exchange(ref AvailableSandboxModules[moduleIndex].LastReplyUpdateTimestamp, Stopwatch.GetTimestamp());
+                            Interlocked.Exchange(ref AvailableSandboxModules[moduleIndex].StaleKickCount, 0);
+                            Interlocked.Exchange(ref AvailableSandboxModules[moduleIndex].RestartInProgress, 0);
 
                             _logger.LogInformation("Got init for module {module}. Eye: {eye} Expr: {expr}...",
                                 AvailableSandboxModules[moduleIndex].ModuleClassName,
@@ -208,7 +501,8 @@ public class UnifiedLibManager : ILibManager
                             AvailableSandboxModules[moduleIndex].ModuleInformation.UsingEye         = !AvailableSandboxModules.Any(m => m.ModuleInformation.UsingEye) && replyInitPacket.eyeSuccess;
                             AvailableSandboxModules[moduleIndex].ModuleInformation.UsingExpression  = !AvailableSandboxModules.Any(m => m.ModuleInformation.UsingExpression) && replyInitPacket.expressionSuccess;
                             AvailableSandboxModules[moduleIndex].ModuleInformation.StaticImages     = replyInitPacket.IconDataStreams;
-                            EnsureModuleThreadStartedSandboxed(AvailableSandboxModules[moduleIndex]);
+                            if (!replyInitPacket.prefersPushUpdates)
+                                EnsureModuleThreadStartedSandboxed(AvailableSandboxModules[moduleIndex]);
 
                             _dispatcherService.Run(() => {
 
@@ -268,6 +562,38 @@ public class UnifiedLibManager : ILibManager
                     case IpcPacket.PacketType.ReplyUpdate:
                         {
                             ReplyUpdatePacket replyUpdatePacket = (ReplyUpdatePacket) packet;
+                            Interlocked.Exchange(ref AvailableSandboxModules[moduleIndex].LastReplyUpdateTimestamp, Stopwatch.GetTimestamp());
+                            Interlocked.Exchange(ref AvailableSandboxModules[moduleIndex].StaleKickCount, 0);
+                            var replyCount = _replyUpdateCounts.TryGetValue(moduleIndex, out var existingReplyCount)
+                                ? existingReplyCount + 1
+                                : 1;
+                            _replyUpdateCounts[moduleIndex] = replyCount;
+                            if (!_replyUpdateLogTimestamps.TryGetValue(moduleIndex, out var lastReplyLogTs))
+                            {
+                                _replyUpdateLogTimestamps[moduleIndex] = Stopwatch.GetTimestamp();
+                                _logger.LogInformation(
+                                    "ReplyUpdate flow started for {module}. pid={pid} port={port} count={count} status={status} usingEye={usingEye} usingExpr={usingExpr}",
+                                    AvailableSandboxModules[moduleIndex].ModuleInformation?.Name ?? AvailableSandboxModules[moduleIndex].ModuleClassName ?? "Unknown",
+                                    AvailableSandboxModules[moduleIndex].SandboxProcessPID,
+                                    AvailableSandboxModules[moduleIndex].SandboxProcessPort,
+                                    replyCount,
+                                    AvailableSandboxModules[moduleIndex].Status,
+                                    AvailableSandboxModules[moduleIndex].ModuleInformation?.UsingEye,
+                                    AvailableSandboxModules[moduleIndex].ModuleInformation?.UsingExpression);
+                            }
+                            else if (Stopwatch.GetElapsedTime(lastReplyLogTs) >= TimeSpan.FromSeconds(5))
+                            {
+                                _replyUpdateLogTimestamps[moduleIndex] = Stopwatch.GetTimestamp();
+                                _logger.LogInformation(
+                                    "ReplyUpdate stats for {module}: pid={pid} port={port} count={count} status={status} usingEye={usingEye} usingExpr={usingExpr}",
+                                    AvailableSandboxModules[moduleIndex].ModuleInformation?.Name ?? AvailableSandboxModules[moduleIndex].ModuleClassName ?? "Unknown",
+                                    AvailableSandboxModules[moduleIndex].SandboxProcessPID,
+                                    AvailableSandboxModules[moduleIndex].SandboxProcessPort,
+                                    replyCount,
+                                    AvailableSandboxModules[moduleIndex].Status,
+                                    AvailableSandboxModules[moduleIndex].ModuleInformation?.UsingEye,
+                                    AvailableSandboxModules[moduleIndex].ModuleInformation?.UsingExpression);
+                            }
 
                             if ( AvailableSandboxModules[moduleIndex].Status == ModuleState.Active && AvailableSandboxModules[moduleIndex].ModuleInformation.Active )
                             {
@@ -280,6 +606,7 @@ public class UnifiedLibManager : ILibManager
                                     replyUpdatePacket.UpdateGlobalExpressionState();
                                 }
                                 replyUpdatePacket.UpdateHeadState();
+                                ParameterSenderService.SignalPendingUpdate();
                             }
 
                             break;
@@ -403,7 +730,7 @@ public class UnifiedLibManager : ILibManager
             var updatePacket = new EventUpdatePacket();
             while (!cts.IsCancellationRequested)
             {
-                Thread.Sleep(10); // Wait 10ms => 100Hz
+                Thread.Sleep(SandboxedUpdateCadenceMs);
                 _sandboxServer.SendData(updatePacket, port);
             }
             _logger.LogDebug("Thread for {module} ended", module.GetType().Name);
@@ -437,32 +764,50 @@ public class UnifiedLibManager : ILibManager
         }
     }
 
-    private bool TeardownModuleSandboxed(ModuleRuntimeInfo module)
+    private bool TeardownModuleSandboxed(ModuleRuntimeInfo module, bool gracefulRequest = true)
     {
         _logger.LogInformation("Tearing down {module} ", module.ModuleClassName);
 
-        // Send a message to the module sub-process
-        var eventTeardownPacket = new EventTeardownPacket();
-        _sandboxServer.SendData(eventTeardownPacket, module.SandboxProcessPort);
+        ReleaseModuleTrackingClaims(module);
+
+        if (gracefulRequest)
+        {
+            // Send a message to the module sub-process
+            var eventTeardownPacket = new EventTeardownPacket();
+            try
+            {
+                _sandboxServer.SendData(eventTeardownPacket, module.SandboxProcessPort);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed sending teardown packet to sandbox module {module}. Forcing process shutdown.", module.ModuleClassName);
+            }
+        }
 
         // Kill the update thread
         module.UpdateCancellationToken?.Cancel();
         // Give the module 100ms to kill itself
         Thread.Sleep(100);
 
+        if (module.Process == null)
+            return true;
+
         // Only bother tearing down a module if it's actually shutdown
-        if ( !(module.Process?.HasExited ?? true) )
+        try
         {
-            _logger.LogDebug("Module process has not yet exited");
-            try  {
-                if (!(module.Process?.WaitForExit(200) ?? false))
+            module.Process.Refresh();
+            if (!module.Process.HasExited)
+            {
+                _logger.LogDebug("Module process has not yet exited");
+                if (!module.Process.WaitForExit(200))
                 {
-                    _logger.LogDebug("Module {id} didn't exit gracefully. Forcing kill...", module.Process?.Id ?? -1);
-                    module.Process?.Kill(entireProcessTree: true);
-                    if (!(module.Process?.WaitForExit(2000) ?? false))
+                    _logger.LogDebug("Module {id} didn't exit gracefully. Forcing kill...", module.Process.Id);
+                    module.Process.Kill(entireProcessTree: true);
+                    if (!module.Process.WaitForExit(2000))
                     {
                         // on windows we can use taskkill /F /T /PID {procId} to force kill a process very aggressively. this has a higher success rate than process.kill!
-                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+                        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                        {
                             using var killer = Process.Start(new ProcessStartInfo
                             {
                                 FileName = "taskkill",
@@ -471,19 +816,28 @@ public class UnifiedLibManager : ILibManager
                                 UseShellExecute = false
                             });
                             killer?.WaitForExit(2000);
-                        } else {
+                        }
+                        else
+                        {
                             _logger.LogCritical("Process {id} is a zombie or stuck in Kernel I/O. Manual intervention required.", module.Process.Id);
                         }
-                        return false; 
+
+                        module.Process.Refresh();
+                        if (!module.Process.HasExited)
+                            return false;
                     }
                 }
-            } catch ( System.ComponentModel.Win32Exception ex ) {
-                // Can fail to call OpenProcessEx due to some error such as ACCESS_DENIED (process has higher priveleges, eg Sraniple)
-                _logger.LogError($"Tried killing process with PID {module.Process.Id}. Got win32 error ({ex.ToString()}");
-            } catch ( Exception ex ) {
-                // Tell the user why we got an exception so that we can hopefully fix it.
-                _logger.LogError($"Tried killing process with PID {module.Process.Id}. Got exception ({ex.HResult}) {ex.Message}");
             }
+        }
+        catch (System.ComponentModel.Win32Exception ex)
+        {
+            _logger.LogError(ex, "Tried killing process with PID {pid}.", module.Process.Id);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Tried killing process with PID {pid}.", module.Process.Id);
+            return false;
         }
 
         if (module.UpdateThread?.IsAlive ?? false)
@@ -495,6 +849,35 @@ public class UnifiedLibManager : ILibManager
         }
 
         return true;
+    }
+
+    private void ReleaseModuleTrackingClaims(ModuleRuntimeInfo module)
+    {
+        var hadEye = module.ModuleInformation?.UsingEye == true;
+        var hadExpression = module.ModuleInformation?.UsingExpression == true;
+
+        if (hadEye)
+            EyeStatus = ModuleState.Uninitialized;
+
+        if (hadExpression)
+            ExpressionStatus = ModuleState.Uninitialized;
+
+        if (module.ModuleInformation != null)
+        {
+            module.ModuleInformation.Active = false;
+            module.ModuleInformation.UsingEye = false;
+            module.ModuleInformation.UsingExpression = false;
+        }
+
+        module.Status = ModuleState.Uninitialized;
+        module.IsActive = false;
+
+        if (module.UpdateThread != null || module.UpdateCancellationToken != null)
+        {
+            _moduleThreads.RemoveAll(pair =>
+                pair.SandboxProcessPID == module.SandboxProcessPID &&
+                pair.SandboxProcessPort == module.SandboxProcessPort);
+        }
     }
 
     // Signal all active modules to gracefully shut down their respective runtimes

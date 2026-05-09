@@ -11,6 +11,7 @@ public class ReplyInitPacket : IpcPacket
 {
     public bool eyeSuccess                  = false;
     public bool expressionSuccess           = false;
+    public bool prefersPushUpdates          = false;
     public string ModuleInformationName     = "";
     public List<Stream> IconDataStreams     = new ();
 
@@ -23,6 +24,7 @@ public class ReplyInitPacket : IpcPacket
 
         int packedData  = eyeSuccess ? 1 : 0;
         packedData = packedData | ( expressionSuccess ? 2 : 0 );
+        packedData = packedData | ( prefersPushUpdates ? 4 : 0 );
 
         byte[] moduleInfoStringData = Encoding.UTF8.GetBytes(ModuleInformationName);
         byte[] moduleInfoSizeBytes  = BitConverter.GetBytes(moduleInfoStringData.Length);
@@ -78,6 +80,7 @@ public class ReplyInitPacket : IpcPacket
         byte packedData = data[8];
         this.eyeSuccess = ( packedData & 1 ) == 1;
         this.expressionSuccess = ( packedData & 2 ) == 2;
+        this.prefersPushUpdates = (packedData & 4) == 4;
 
         int moduleInfoStringLength  = BitConverter.ToInt32(data, 9);
         ModuleInformationName       = Encoding.UTF8.GetString(data, 13, moduleInfoStringLength);

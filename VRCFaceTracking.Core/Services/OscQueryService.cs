@@ -1,5 +1,6 @@
 ﻿using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using Microsoft.Extensions.Logging;
 using VRCFaceTracking.Core.Contracts;
@@ -27,6 +28,7 @@ public partial class OscQueryService(
 {
     [ObservableProperty] private IAvatarInfo _avatarInfo = new NullAvatarDef("Loading...", "Loading...");
     [ObservableProperty] private List<Parameter> _avatarParameters;
+    private int _avatarRefreshInFlight;
 
     public async Task InitializeAsync()
     {
@@ -78,31 +80,62 @@ public partial class OscQueryService(
         HandleNewAvatar();
     }
 
-    private async void HandleNewAvatar(string newId = null)
+    private async void HandleNewAvatar(string newId = null, bool forceRefresh = false)
     {
-        (IAvatarInfo avatarInfo, List<Parameter> relevantParameters)? newAvatar;
-        if (multicastDnsService.VrchatClientEndpoint != null)
-        {
-            newAvatar = await oscQueryConfigParser.ParseAvatar("");
-        }
-        else
-        {
-            // handle normal osc
-            newAvatar = await avatarConfigParser.ParseAvatar(newId);
-        }
-
-        if (!newAvatar.HasValue)
+        if (Interlocked.Exchange(ref _avatarRefreshInFlight, 1) == 1)
         {
             return;
         }
 
-        // Parsing success. Deregister callback and update values
-        httpHandler.OnHostInfoQueried -= HandleNewAvatarWrapper;
-        dispatcherService.Run(() =>
+        try
         {
-            AvatarInfo = newAvatar.Value.avatarInfo;
-            AvatarParameters = newAvatar.Value.relevantParameters;
-        });
+            // OSCQuery host-info requests can recur during a session. Once a valid avatar is already
+            // loaded, reparsing the same avatar just resets parameter state and adds churn to the live path.
+            if (!forceRefresh &&
+                multicastDnsService.VrchatClientEndpoint != null &&
+                AvatarParameters is { Count: > 0 } &&
+                AvatarInfo is not NullAvatarDef)
+            {
+                return;
+            }
+
+            if (!forceRefresh &&
+                multicastDnsService.VrchatClientEndpoint == null &&
+                !string.IsNullOrWhiteSpace(newId) &&
+                string.Equals(newId, AvatarInfo?.Id, StringComparison.Ordinal) &&
+                AvatarParameters is { Count: > 0 })
+            {
+                return;
+            }
+
+            (IAvatarInfo avatarInfo, List<Parameter> relevantParameters)? newAvatar;
+            if (multicastDnsService.VrchatClientEndpoint != null)
+            {
+                newAvatar = await oscQueryConfigParser.ParseAvatar("");
+            }
+            else
+            {
+                // handle normal osc
+                newAvatar = await avatarConfigParser.ParseAvatar(newId);
+            }
+
+            if (!newAvatar.HasValue)
+            {
+                return;
+            }
+
+            // Parsing success. Deregister callback and update values
+            httpHandler.OnHostInfoQueried -= HandleNewAvatarWrapper;
+            dispatcherService.Run(() =>
+            {
+                AvatarInfo = newAvatar.Value.avatarInfo;
+                AvatarParameters = newAvatar.Value.relevantParameters;
+            });
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _avatarRefreshInFlight, 0);
+        }
     }
 
     private void HandleNewAvatarWrapper() => HandleNewAvatar(); // Helper func used in callbacks
@@ -113,7 +146,7 @@ public partial class OscQueryService(
         switch (msg.Address)
         {
             case "/avatar/change":
-                HandleNewAvatar(msg.Value as string);
+                HandleNewAvatar(msg.Value as string, forceRefresh: true);
                 break;
             case "/vrcft/settings/forceRelevant":   // Endpoint for external tools to force vrcft to send all parameters
                 if (msg.Value is bool relevancy)
