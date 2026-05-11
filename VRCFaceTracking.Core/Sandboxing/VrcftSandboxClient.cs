@@ -7,10 +7,12 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using VRCFaceTracking.Core.Models;
 using VRCFaceTracking.Core.Sandboxing.IPC;
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 
 namespace VRCFaceTracking.Core.Sandboxing;
 
@@ -18,12 +20,18 @@ public delegate void OnPacketReceivedCallback(in IpcPacket packet);
 
 public class VrcftSandboxClient : UdpFullDuplex
 {
+    private static readonly TimeSpan HandshakeRetryTimeout = TimeSpan.FromMilliseconds(250);
     // private int                                     _port = 0;
     private IPEndPoint                              _serverEndpoint;
     private readonly ILoggerFactory                 _loggerFactory;
     private readonly ILogger<VrcftSandboxClient>    _logger;
     private bool                                    _isConnected;
     private int                                     _maxPacketSizeBytes;
+    private string?                                 _modulePath;
+    private int                                     _reconnectInProgress;
+    private int                                     _handshakePending;
+    private long                                    _lastHandshakeSendTimestamp;
+    public bool IsConnected => _isConnected;
 
     public OnPacketReceivedCallback OnPacketReceivedCallback = null;
     public VrcftSandboxClient(int portNumber,
@@ -50,10 +58,20 @@ public class VrcftSandboxClient : UdpFullDuplex
 
     public void Connect(in string modulePath)
     {
+        _modulePath = modulePath;
+        if (!TryBeginHandshake("connect"))
+            return;
+
         var handshakePkt = new HandshakePacket();
         handshakePkt.ModulePath = modulePath;
         _logger.LogInformation($"Attempting to connect to server...");
-        SendData(handshakePkt, _serverEndpoint);
+        if (!TrySendBytes(handshakePkt.GetBytes()))
+        {
+            Interlocked.Exchange(ref _handshakePending, 0);
+            return;
+        }
+        Interlocked.Exchange(ref _lastHandshakeSendTimestamp, Stopwatch.GetTimestamp());
+
         // Take the lower bound of packet rate we can fit through the network
         _maxPacketSizeBytes = Math.Min(_receivingUdpClient.Client.ReceiveBufferSize, _receivingUdpClient.Client.SendBufferSize);
     }
@@ -89,17 +107,87 @@ public class VrcftSandboxClient : UdpFullDuplex
                 {
                     _logger.LogInformation($"Received ACK from host on port {endpoint.Port}. Handshake done.");
                     _isConnected = true;
+                    Interlocked.Exchange(ref _handshakePending, 0);
                     SendAllPendingPackets();
                 }
             }
         }
     }
 
-    private void SendData(in byte[] message)
+    private bool TryBeginHandshake(string reason)
     {
-        // @TODO: Check packet size, if too big, convert to partial packet, and send partial packets
-        _receivingUdpClient.Send(message, message.Length, _serverEndpoint);
+        if (Interlocked.CompareExchange(ref _handshakePending, 1, 0) == 0)
+            return true;
+
+        var staleFor = Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastHandshakeSendTimestamp));
+        if (staleFor < HandshakeRetryTimeout)
+            return false;
+
+        Interlocked.Exchange(ref _handshakePending, 0);
+        return Interlocked.CompareExchange(ref _handshakePending, 1, 0) == 0;
     }
+
+    private bool TrySendBytes(in byte[] message)
+    {
+        try
+        {
+            // @TODO: Check packet size, if too big, convert to partial packet, and send partial packets
+            _receivingUdpClient.Send(message, message.Length, _serverEndpoint);
+            if (!_isConnected && message.Length > 0)
+                Interlocked.Exchange(ref _lastHandshakeSendTimestamp, Stopwatch.GetTimestamp());
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            _isConnected = false;
+            return false;
+        }
+        catch (SocketException)
+        {
+            _isConnected = false;
+            return false;
+        }
+    }
+
+    private void TryReconnect()
+    {
+        if (string.IsNullOrWhiteSpace(_modulePath))
+            return;
+
+        if (_isConnected)
+            return;
+
+        if (!TryBeginHandshake("reconnect"))
+            return;
+
+        if (Interlocked.Exchange(ref _reconnectInProgress, 1) == 1)
+        {
+            Interlocked.Exchange(ref _handshakePending, 0);
+            return;
+        }
+
+        try
+        {
+            var handshakePkt = new HandshakePacket
+            {
+                ModulePath = _modulePath
+            };
+
+            if (!TrySendBytes(handshakePkt.GetBytes()))
+            {
+                Interlocked.Exchange(ref _handshakePending, 0);
+            }
+            else
+            {
+                Interlocked.Exchange(ref _lastHandshakeSendTimestamp, Stopwatch.GetTimestamp());
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _reconnectInProgress, 0);
+        }
+    }
+
     public void SendData(in IpcPacket packet)
     {
         if ( _isConnected || packet.GetPacketType() == IpcPacket.PacketType.Handshake)
@@ -111,18 +199,28 @@ public class VrcftSandboxClient : UdpFullDuplex
                 byte[][] packetChunkBytes = PartialPacket.SplitPacketIntoChunks(packetData, MTU);
                 foreach ( var packetChunk in packetChunkBytes )
                 {
-                    SendData(packetChunk);
+                    if (!TrySendBytes(packetChunk))
+                    {
+                        _eventBus.Push(packet);
+                        TryReconnect();
+                        return;
+                    }
                     Thread.Sleep(1);    //TODO: Potentially switch to ACK based chunking system
                 }
             }
             else
             {
-                SendData(packetData);
+                if (!TrySendBytes(packetData))
+                {
+                    _eventBus.Push(packet);
+                    TryReconnect();
+                }
             }
         }
         else
         {
             _eventBus.Push(packet);
+            TryReconnect();
         }
     }
 

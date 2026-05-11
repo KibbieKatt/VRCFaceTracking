@@ -48,10 +48,20 @@ public class VrcftSandboxServer : UdpFullDuplex
                 var handshakePacket = (HandshakePacket) packet;
                 if ( handshakePacket.IsValid )
                 {
-                    _logger.LogInformation($"Received handshake from port {endpoint.Port}. Sending ACK...");
+                    var isDuplicateHandshake = _connectedClients.Contains(endpoint.Port);
+                    if ( !isDuplicateHandshake )
+                    {
+                        _logger.LogInformation($"Received handshake from port {endpoint.Port}. Sending ACK...");
+                        _connectedClients.Add(endpoint.Port);
+                    }
+
                     // Return ACK
                     SendData(in packet, in endpoint);
-                    _connectedClients.Add(endpoint.Port);
+
+                    if ( isDuplicateHandshake )
+                    {
+                        return;
+                    }
                 }
             }
             if ( OnPacketReceived != null )

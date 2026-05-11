@@ -59,11 +59,32 @@ public class ModuleRuntimeInfo
     /// Whether this module supports expression tracking or not.
     /// </summary>
     public bool SupportsExpressionTracking;
+    public bool PrefersPushUpdates;
 
     /// <summary>
     /// Queue of packets to send
     /// </summary>
     public Queue<QueuedPacket> EventBus;
+
+    /// <summary>
+    /// Last time a ReplyUpdate packet was seen from this module.
+    /// </summary>
+    public long LastReplyUpdateTimestamp = Stopwatch.GetTimestamp();
+
+    /// <summary>
+    /// Number of stale watchdog kicks issued for this module.
+    /// </summary>
+    public int StaleKickCount;
+
+    /// <summary>
+    /// Number of restart attempts issued for this module.
+    /// </summary>
+    public int RestartCount;
+
+    /// <summary>
+    /// Whether a restart is already in progress.
+    /// </summary>
+    public int RestartInProgress;
 }
 
 public struct QueuedPacket

@@ -1,4 +1,5 @@
-﻿using System.Runtime.CompilerServices;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using VRCFaceTracking.Core.Contracts.Services;
 using VRCFaceTracking.Core.Library;
@@ -27,6 +28,7 @@ public class MainStandalone : IMainService
         _logger = logger;
         _libManager = libManager;
         _mutator = mutator;
+        TryElevateProcessPriority();
     }
 
     public async Task Teardown()
@@ -77,5 +79,22 @@ public class MainStandalone : IMainService
         }
 
         return Task.CompletedTask;
+    }
+
+    private void TryElevateProcessPriority()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            using var currentProcess = Process.GetCurrentProcess();
+            currentProcess.PriorityClass = ProcessPriorityClass.AboveNormal;
+            _logger.LogDebug("Set VRCFT process priority to {PriorityClass}", currentProcess.PriorityClass);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to elevate VRCFT process priority");
+        }
     }
 }
